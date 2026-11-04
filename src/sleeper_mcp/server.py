@@ -114,6 +114,22 @@ def _resolve_list(
     return out
 
 
+def _resolve_anywhere(names: list[str] | None, ctx: LeagueContext, me: Team) -> set[str]:
+    """Resolve names against your roster first, then every roster in the league."""
+    out: set[str] = set()
+    for q in names or []:
+        hits = api.players.resolve(q, within=me.players)
+        if not hits:
+            hits = api.players.resolve(q, within=sorted(ctx.rostered))
+        if not hits:
+            raise SleeperAPIError(f"'{q}' isn't on any roster in this league.")
+        if len(hits) > 1:
+            opts = ", ".join(api.players.label(h) for h in hits[:5])
+            raise SleeperAPIError(f"'{q}' matches several rostered players: {opts}. Be more specific.")
+        out.add(hits[0])
+    return out
+
+
 def _percentiles(values: dict[str, float]) -> dict[str, float]:
     """Map each key to its percentile (0..1) among the values; ties share a rank."""
     if not values:
@@ -357,6 +373,20 @@ async def find_trades(
             ge=0,
         ),
     ] = DEFAULT_MAX_PARTNER_LOSS,
+    exclude_players: Annotated[
+        list[str] | None,
+        Field(
+            description="Players to leave out of every idea, by name or player ID: your untouchables, "
+            "players you've already decided to keep, or players on other teams you don't want."
+        ),
+    ] = None,
+    must_send: Annotated[
+        list[str] | None,
+        Field(
+            description="Players from your roster that every idea must include on your side, by name or "
+            "player ID (e.g. ['Bijan Robinson'] to shop him). At most max_players_per_side players."
+        ),
+    ] = None,
 ) -> dict[str, Any]:
     """Search every other roster for trades that improve your starting lineup.
 
@@ -367,6 +397,10 @@ async def find_trades(
     where both teams' rest-of-season lineup projection goes up are returned in
     `win_win`, sorted by how much they help you. `one_sided` lists trades that help
     you but cost the partner, up to `max_partner_loss` points per week.
+
+    Use exclude_players for players you won't trade (or don't want), and must_send
+    to shop a specific player. Without them, a low-value bench player you'd never
+    actually move can dominate the ideas.
 
     Win-win ideas are realistic offers: the other team gains too. One-sided ideas
     show what an upgrade would take; their_gain tells you how big a sweetener it
@@ -392,6 +426,17 @@ async def find_trades(
     else:
         partners = [t for t in ctx.teams.values() if t.roster_id != me.roster_id and t.owner_id]
 
+    excluded = _resolve_anywhere(exclude_players, ctx, me)
+    forced = _resolve_list(must_send, me.players, me.name)
+    if len(forced) > max_players_per_side:
+        raise SleeperAPIError(
+            f"must_send lists {len(forced)} players but max_players_per_side is {max_players_per_side}."
+        )
+    clash = set(forced) & excluded
+    if clash:
+        names = ", ".join(api.players.name(p) for p in clash)
+        raise SleeperAPIError(f"{names} is in both must_send and exclude_players.")
+
     val = Valuation(ctx, prod)
     win_win, one_sided = await asyncio.to_thread(
         val.search,
@@ -400,6 +445,8 @@ async def find_trades(
         max_per_side=max_players_per_side,
         receive_positions=recv,
         max_partner_loss=max_partner_loss,
+        exclude=excluded,
+        must_send=forced,
     )
     loose = max_partner_loss is None or max_partner_loss > DEFAULT_MAX_PARTNER_LOSS
     ranks = position_strength_ranks(ctx, prod)
@@ -437,6 +484,10 @@ async def find_trades(
         "my_needs": needs or "No thin positions detected.",
         "weeks_simulated": _weeks_label(val),
         "how_measured": LINEUP_METHOD,
+        "filters": {
+            "excluded": [api.players.label(p) for p in excluded] or None,
+            "must_send": [api.players.label(p) for p in forced] or None,
+        },
         "win_win": [render(f) for f in win_win[:limit]]
         or "No trade improves both lineups right now. That's common when your bench has few "
         "players who would start elsewhere.",
@@ -455,8 +506,14 @@ async def find_trades(
             "They'd likely need a sweetener: a bench player, a draft pick, or FAAB. "
             "Raise max_partner_loss to see bigger, more lopsided upgrades."
         )
-    elif loose:
-        result["one_sided"] = f"No trades help you by at least 1 point per week within {limit_text}."
+    elif not one_sided and len(win_win) < limit:
+        msg = f"No trades help you by at least 1 point per week while costing the other team {limit_text}."
+        if forced:
+            sent = " + ".join(api.players.name(p) for p in forced)
+            msg += f" Moving {sent} for a lineup upgrade usually costs the other side more than that."
+        if max_partner_loss is not None:
+            msg += " Raise max_partner_loss (e.g. 3-5) to see what it would take."
+        result["one_sided"] = msg
     notes = _trade_notes(ctx, prod)
     if notes:
         result["notes"] = notes

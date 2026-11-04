@@ -21,7 +21,7 @@ good for me?" about your real league.
 | --- | --- |
 | `waiver_wire` | Ranks unrostered players by projected points, recent production and trending adds, with injury, bye week and opponent. If you pass your team, it flags your thin positions and which players fill them. |
 | `trade_context` | Both rosters by position with production, projections, value over replacement, records, league-wide positional ranks, needs, traded picks and scoring rules. If you list players, it simulates both lineups week by week through the fantasy playoffs, before and after the trade. It gives Claude context and doesn't judge the trade itself. |
-| `find_trades` | Searches every other roster for 1-for-1, 2-for-1 and 1-for-2 trades that improve your lineup. Trades that help both sides are listed first. One-sided trades follow, limited by `max_partner_loss` (see below). |
+| `find_trades` | Searches every other roster for 1-for-1, 2-for-1 and 1-for-2 trades that improve your lineup. Trades that help both sides are listed first. One-sided trades follow, limited by `max_partner_loss`. You can rule players out with `exclude_players` or shop one with `must_send` (see below). |
 | `get_user` | Username → `user_id`. |
 | `my_leagues` | A user's leagues for a season, with your `roster_id` and record in each. |
 | `league_overview` | Standings, every team's `roster_id`, lineup, scoring, waiver and playoff rules. |
@@ -81,6 +81,17 @@ weigh.
   pass null for no limit, to always see the biggest upgrades for you, ranked by
   your gain. With no limit, expect fantasies like "your backup QB for their two
   best players". That shows you the ceiling, not a realistic offer.
+
+Two more filters keep `find_trades` focused:
+
+- `exclude_players` leaves players out of every idea. Use it for untouchables,
+  players you won't move, or players on other teams you don't want.
+- `must_send` puts one or two of your players into every idea. Use it to shop a
+  player, e.g. `["Bijan Robinson"]`.
+
+Without filters, a cheap bench player can be the "send" side of many ideas, so
+no single offer appears more than twice. Players forced in with `must_send`
+don't count toward that cap.
 
 `find_trades` first screens every combination on a typical week. It then
 simulates the best few dozen candidates week by week and keeps only those
@@ -195,6 +206,7 @@ publish the URL.
 - "I'm thinking of trading Kirk Cousins to roster 1 for Quinshon Judkins. Give me the context and your take."
 - "Find me a trade that upgrades my TE without hurting my playoff weeks."
 - "Show me the biggest upgrades I could get, even if they're lopsided." (`max_partner_loss` raised)
+- "What could I get for Bijan? Mahomes and Walker are untouchable." (`must_send` + `exclude_players`)
 - "Show week 8 transactions in my league."
 - "Who owns my 2027 picks?"
 

@@ -95,3 +95,41 @@ def test_max_partner_loss_controls_one_sided_trades():
     win, loose = v.search(me, [them], max_per_side=1, max_partner_loss=None)
     assert loose and loose[0]["get"] == ["b_wr1"]
     assert loose[0]["my_total"] == 17 and loose[0]["their_total"] == -9
+
+
+def _three_team_setup():
+    pos = {"a_rb1": "RB", "a_rb2": "RB", "a_rb3": "RB", "a_wr": "WR", "b_wr1": "WR", "b_wr2": "WR", "b_rb": "RB"}
+    ros = {"a_rb1": 15, "a_rb2": 12, "a_rb3": 11, "a_wr": 3, "b_wr1": 20, "b_wr2": 4, "b_rb": 5}
+    v = _valuation(ros, pos, ["RB", "WR"])
+    return v, _team(1, ["a_rb1", "a_rb2", "a_rb3", "a_wr"]), _team(2, ["b_wr1", "b_wr2", "b_rb"])
+
+
+def test_exclude_players_removes_them_from_both_sides():
+    v, me, them = _three_team_setup()
+    win, one = v.search(me, [them], max_per_side=1, max_partner_loss=None, exclude={"a_rb2", "b_wr1"})
+    for d in win + one:
+        assert "a_rb2" not in d["give"] and "b_wr1" not in d["get"]
+
+
+def test_must_send_is_in_every_result():
+    v, me, them = _three_team_setup()
+    win, one = v.search(me, [them], max_per_side=2, max_partner_loss=None, must_send=["a_rb1"])
+    results = win + one
+    assert results and all("a_rb1" in d["give"] for d in results)
+
+
+def test_must_send_larger_than_side_limit_is_rejected():
+    import pytest
+
+    v, me, them = _three_team_setup()
+    with pytest.raises(ValueError):
+        v.search(me, [them], max_per_side=1, must_send=["a_rb1", "a_rb2"])
+
+
+def test_one_offer_cannot_fill_the_list():
+    from sleeper_mcp.trade import _spread
+
+    rows = [{"give": ["cousins"], "get": [f"x{i}"]} for i in range(5)] + [{"give": ["egbuka"], "get": ["y"]}]
+    assert [d["give"] for d in _spread(rows)] == [["cousins"], ["cousins"], ["egbuka"]]
+    # A forced player alone is never capped: varying what comes back is the point.
+    assert len(_spread(rows, forced=("cousins",))) == 6

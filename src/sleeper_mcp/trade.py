@@ -57,6 +57,25 @@ def free_agents(ctx: LeagueContext, prod: Production, positions: set[str] | None
     return out
 
 
+def _spread(results: list[dict], forced: tuple[str, ...] = (), per_offer: int = 2) -> list[dict]:
+    """Stop one offer (e.g. a backup QB) from filling the whole list.
+
+    Each set of players sent appears at most `per_offer` times. Players the user
+    forced into every trade don't count: if the only thing sent is the forced
+    player, there's no cap, since varying what comes back is the point.
+    """
+    seen: dict[frozenset[str], int] = {}
+    out = []
+    for d in results:
+        key = frozenset(d["give"]) - set(forced)
+        if key:
+            if seen.get(key, 0) >= per_offer:
+                continue
+            seen[key] = seen.get(key, 0) + 1
+        out.append(d)
+    return out
+
+
 def _top_mean(values: Iterable[float], n: int) -> float:
     top = sorted(values, reverse=True)[:n]
     return sum(top) / len(top) if top else 0.0
@@ -199,7 +218,9 @@ class Valuation:
         receive_positions: set[str] | None = None,
         min_partner_gain: float = 0.25,
         max_partner_loss: float | None = DEFAULT_MAX_PARTNER_LOSS,
-        shortlist: int = 25,
+        exclude: set[str] | None = None,
+        must_send: list[str] | None = None,
+        shortlist: int = 40,
     ) -> tuple[list[dict], list[dict]]:
         """Find trades that help you. Screens on a typical week, then re-scores the
         best candidates week by week through the playoffs.
@@ -209,15 +230,23 @@ class Valuation:
         lineup points per week (None = no limit). With the default limit,
         one-sided trades are ranked closest-to-fair first; with a looser limit,
         by how much they help you.
+
+        `exclude` players never appear on either side (your untouchables, or
+        players you don't want). Every result sends all of `must_send`, even
+        players the normal filter would skip (K/DEF, IR, below replacement).
         """
+        exclude = exclude or set()
+        forced = tuple(must_send or ())
+        if len(forced) > max_per_side:
+            raise ValueError(f"must_send has {len(forced)} players but max_per_side is {max_per_side}.")
         floor = float("-inf") if max_partner_loss is None else -abs(max_partner_loss)
         favor_me = max_partner_loss is None or abs(max_partner_loss) > DEFAULT_MAX_PARTNER_LOSS
         my_base = self.typical_week(me.players)
-        mine = self.tradeable(me)
+        mine = [p for p in self.tradeable(me) if p not in exclude and p not in forced]
         screened: list[tuple[float, Team, tuple[str, ...], tuple[str, ...], float, float]] = []
 
         for t in partners:
-            theirs = self.tradeable(t)
+            theirs = [p for p in self.tradeable(t) if p not in exclude]
             if receive_positions:
                 theirs_recv = [p for p in theirs if set(self.db.positions(p)) & receive_positions]
             else:
@@ -229,7 +258,10 @@ class Valuation:
                 for n_in in range(1, max_per_side + 1):
                     if n_out + n_in > 3:  # 2-for-2 rarely gets accepted and explodes the search
                         continue
-                    for give in itertools.combinations(mine, n_out):
+                    if n_out < len(forced):
+                        continue
+                    gives = (forced + extra for extra in itertools.combinations(mine, n_out - len(forced)))
+                    for give in gives:
                         for get in itertools.combinations(theirs, n_in):
                             if receive_positions and not any(p in theirs_recv for p in get):
                                 continue
@@ -279,7 +311,7 @@ class Valuation:
             one_sided.sort(key=lambda d: d["my_total"], reverse=True)
         else:
             one_sided.sort(key=lambda d: d["my_total"] + d["their_total"], reverse=True)
-        return win_win, one_sided
+        return _spread(win_win, forced), _spread(one_sided, forced)
 
     def _detail(self, me: Team, t: Team, give: tuple[str, ...], get: tuple[str, ...]) -> dict:
         my_after = [p for p in me.players if p not in give] + list(get)
