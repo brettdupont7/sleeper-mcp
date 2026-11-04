@@ -145,13 +145,20 @@ class Sleeper:
         self,
         ctx: "LeagueContext",
         recent_weeks: int = 3,
-        proj_weeks: int = 3,
+        near_weeks: int = 3,
+        rest_of_season: bool = False,
     ) -> "Production":
-        """Stats/projections/schedule for the league's season, scored under its rules."""
+        """Stats/projections/schedule for the league's season, scored under its rules.
+
+        `near_weeks` projections are always fetched. With `rest_of_season`, every
+        week through the end of the fantasy playoffs is fetched too (one call each).
+        """
         season = ctx.season
         weeks_done = ctx.completed_weeks
         recent = weeks_done[-recent_weeks:] if recent_weeks else []
-        upcoming = ctx.upcoming_weeks(proj_weeks)
+        upcoming = ctx.upcoming_weeks(near_weeks)
+        if rest_of_season:
+            upcoming = sorted(set(upcoming) | set(ctx.remaining_weeks))
 
         results = await asyncio.gather(
             self.undoc.season_stats(season),
@@ -162,7 +169,9 @@ class Sleeper:
         season_stats, games = results[0], results[1]
         week_stats = dict(zip(recent, results[2 : 2 + len(recent)]))
         week_proj = dict(zip(upcoming, results[2 + len(recent) :]))
-        return Production(ctx, self.players, season_stats, week_stats, week_proj, Schedule(games))
+        return Production(
+            ctx, self.players, season_stats, week_stats, week_proj, Schedule(games), near_weeks=near_weeks
+        )
 
     async def trending_counts(self, lookback_hours: int = 48, limit: int = 300) -> dict[str, int]:
         rows = await self.trending("add", lookback_hours, limit)
@@ -304,6 +313,34 @@ class LeagueContext:
             return []
         return [w for w in range(cw, cw + n) if w <= 18]
 
+    @property
+    def playoff_weeks(self) -> list[int]:
+        """Fantasy playoff weeks, from playoff_week_start, team count and round type."""
+        start = int(self.settings.get("playoff_week_start") or 0)
+        teams = int(self.settings.get("playoff_teams") or 0)
+        if not start or teams < 2:
+            return []
+        rounds = math.ceil(math.log2(teams))
+        # playoff_round_type: 0 = one week per round, 1 = two-week final, 2 = two weeks per round.
+        kind = self.settings.get("playoff_round_type") or 0
+        n = rounds + 1 if kind == 1 else rounds * 2 if kind == 2 else rounds
+        return [w for w in range(start, start + n) if w <= 18]
+
+    @property
+    def last_fantasy_week(self) -> int:
+        pw = self.playoff_weeks
+        return pw[-1] if pw else 17
+
+    @property
+    def remaining_weeks(self) -> list[int]:
+        """Weeks from the current one through the end of the fantasy playoffs."""
+        cw = self.current_week
+        if cw is None:
+            if self.is_current_season and self.state.get("season_type") in ("pre", "off"):
+                return list(range(1, self.last_fantasy_week + 1))
+            return []
+        return list(range(cw, self.last_fantasy_week + 1))
+
     def team_summary(self, t: Team) -> dict[str, Any]:
         out: dict[str, Any] = {
             "roster_id": t.roster_id,
@@ -332,6 +369,7 @@ class Production:
         week_stats: dict[int, dict[str, dict]],
         week_proj: dict[int, dict[str, dict]],
         schedule: Schedule,
+        near_weeks: int = 3,
     ):
         self.ctx = ctx
         self.db = players
@@ -341,7 +379,10 @@ class Production:
         self.schedule = schedule
         self.recent_weeks = sorted(week_stats)
         self.proj_weeks = sorted(week_proj)
+        self.near_weeks = self.proj_weeks[:near_weeks]
+        self.near_key = f"proj_avg_next_{len(self.near_weeks)}"
         self._cache: dict[str, dict[str, Any]] = {}
+        self._wv: dict[tuple[str, int | None], float] = {}
 
     @property
     def has_stats(self) -> bool:
@@ -385,7 +426,7 @@ class Production:
             # Averaged over games actually played, so a missed game isn't a zero.
             out["recent_avg"] = r1(sum(played) / len(played)) if played else None
 
-        proj_vals = []
+        near_vals, ros_vals = [], []
         for i, w in enumerate(self.proj_weeks):
             opp = self.schedule.opponent(team, w)
             row = self.week_proj[w].get(pid)
@@ -397,9 +438,14 @@ class Production:
                 if opp:
                     out["opp_this_week"] = opp
             if opp != "BYE" and val is not None:
-                proj_vals.append(val)
-        if len(self.proj_weeks) > 1:
-            out[f"proj_avg_next_{len(self.proj_weeks)}"] = r1(sum(proj_vals) / len(proj_vals)) if proj_vals else None
+                ros_vals.append(val)
+                if w in self.near_weeks:
+                    near_vals.append(val)
+        if len(self.near_weeks) > 1:
+            out[self.near_key] = r1(sum(near_vals) / len(near_vals)) if near_vals else None
+        if len(self.proj_weeks) > len(self.near_weeks):
+            # Per game played; byes are excluded rather than counted as zeros.
+            out["proj_avg_rest_of_season"] = r1(sum(ros_vals) / len(ros_vals)) if ros_vals else None
 
         bye = self.schedule.bye_week(team)
         if bye:
@@ -410,11 +456,50 @@ class Production:
     def value(self, pid: str) -> float:
         """Single forward-looking number used for ranking and lineup building."""
         n = self.numbers(pid)
-        for key in (f"proj_avg_next_{len(self.proj_weeks)}", "proj_this_week", "recent_avg", "ppg"):
+        for key in (self.near_key, "proj_this_week", "recent_avg", "ppg"):
             v = n.get(key)
             if v is not None:
                 return float(v)
         return 0.0
+
+    def ros_value(self, pid: str) -> float:
+        """Projected points per game for the rest of the season (falls back to value())."""
+        n = self.numbers(pid)
+        v = n.get("proj_avg_rest_of_season")
+        if v is not None:
+            return float(v)
+        if "proj_avg_rest_of_season" in n and is_unavailable(self.db.get(pid)):
+            return 0.0  # injured with no projections for any remaining week
+        return self.value(pid)
+
+    def week_value(self, pid: str, week: int | None) -> float:
+        """Projected points in one week: 0 on a bye, or this week if Out/IR.
+
+        `week=None` means "a typical week" and returns value(); used when there
+        are no weekly projections (offseason, season over).
+        """
+        key = (pid, week)
+        if key in self._wv:
+            return self._wv[key]
+        if week is None:
+            v = self.value(pid)
+        else:
+            p = self.db.get(pid)
+            team = p.get("team")
+            if self.schedule.opponent(team, week) == "BYE" or not nfl_team_ok(team):
+                v = 0.0
+            elif week == self.ctx.current_week and is_unavailable(p):
+                v = 0.0
+            else:
+                row = self.week_proj.get(week, {}).get(pid)
+                if row is not None:
+                    v = points(row, self.ctx.scoring) or 0.0
+                elif (p.get("injury_status") or "") in ("IR", "PUP", "NA", "Sus"):
+                    v = 0.0
+                else:
+                    v = self.value(pid)
+        self._wv[key] = v
+        return v
 
     def this_week_value(self, pid: str) -> float:
         n = self.numbers(pid)

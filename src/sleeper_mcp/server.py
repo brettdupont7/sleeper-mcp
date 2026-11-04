@@ -18,15 +18,15 @@ from .sleeper import (
     Production,
     Sleeper,
     Team,
-    best_lineup,
     injury_text,
     is_unavailable,
-    nfl_team_ok,
     position_strength_ranks,
+    position_targets,
     positional_depth,
     r1,
     roster_needs,
 )
+from .trade import DEFAULT_MAX_PARTNER_LOSS, REPLACEMENT_DEPTH, Valuation, free_agents
 
 log = logging.getLogger("sleeper_mcp")
 
@@ -34,12 +34,15 @@ INSTRUCTIONS = """\
 Read-only tools for Sleeper fantasy football (NFL). Nothing here can change a league.
 
 Typical flow: get_user or my_leagues (from a Sleeper username) -> league_overview to
-see teams and roster_ids -> waiver_wire / trade_context for decisions.
+see teams and roster_ids -> waiver_wire for pickups, find_trades to discover trade
+ideas, trade_context to dig into a specific trade.
 
 All points are computed under the specific league's scoring_settings. Stats and
 projections come from undocumented Sleeper endpoints and can be missing; tools say so
-in a `notes` field when that happens. trade_context returns context, not a verdict:
-weigh it yourself (team needs, record, playoff odds, bye weeks, injuries, picks).
+in a `notes` field when that happens. `vs_replacement` is projected points per game
+above the best free agents at that position in this league, the fairest single number
+for comparing players across positions. trade_context and find_trades return context,
+not a verdict: weigh it yourself (record, playoff odds, injuries, picks, the manager).
 """
 
 mcp = FastMCP("sleeper", instructions=INSTRUCTIONS)
@@ -122,22 +125,14 @@ def _percentiles(values: dict[str, float]) -> dict[str, float]:
     return {k: idx[v] for k, v in values.items()}
 
 
-def _lineup_view(filled: dict[str, list[tuple[str, float]]]) -> list[str]:
-    out = []
-    for slot, rows in filled.items():
-        for pid, v in rows:
-            out.append(f"{slot}: {api.players.name(pid) if pid else '(empty)'} {r1(v)}")
-    return out
-
-
-def _team_roster_view(t: Team, prod: Production) -> dict[str, list[dict[str, Any]]]:
+def _team_roster_view(t: Team, prod: Production, val: Valuation) -> dict[str, list[dict[str, Any]]]:
     starters, ir, taxi = set(t.starters), set(t.reserve), set(t.taxi)
     out: dict[str, list[dict[str, Any]]] = {}
     for pos, pids in positional_depth(t, prod).items():
         cards = []
         for pid in pids:
             tag = "IR" if pid in ir else "taxi" if pid in taxi else "starter" if pid in starters else "bench"
-            cards.append(prod.player_card(pid, extra={"slot": tag}))
+            cards.append(prod.player_card(pid, extra={"slot": tag, "vs_replacement": r1(val.vor(pid))}))
         out[pos] = cards
     return out
 
@@ -184,24 +179,8 @@ async def waiver_wire(
             raise SleeperAPIError(f"{position} isn't a starting position in this league ({sorted(wanted)}).")
         wanted = filt & wanted
 
-    rostered = ctx.rostered
     db = api.players
-    has_signal = set(prod.season_stats) | set(trend)
-    for wk in prod.week_proj.values():
-        has_signal |= set(wk)
-
-    candidates: list[str] = []
-    for pid in has_signal:
-        if pid in rostered:
-            continue
-        p = db.get(pid)
-        if not p or not nfl_team_ok(p.get("team")):
-            continue
-        if not set(db.positions(pid)) & wanted:
-            continue
-        if p.get("position") != "DEF" and p.get("active") is False:
-            continue
-        candidates.append(pid)
+    candidates = free_agents(ctx, prod, wanted)
 
     ranks = position_strength_ranks(ctx, prod)
     needs = roster_needs(me, ctx, prod, ranks) if me else {}
@@ -280,113 +259,331 @@ async def trade_context(
 ) -> dict[str, Any]:
     """Gather everything needed to evaluate a trade between two teams.
 
-    Returns both rosters grouped by position (with each player's season points per
-    game, last-3-week production, projections, injury and bye), records and points,
-    league-wide positional ranks, roster needs, draft picks each side has acquired or
-    traded away, and the league's scoring and roster rules. If players_out/players_in
-    are given, also shows each side's best projected lineup before and after the deal.
-    This is context for you to reason over; it deliberately does not judge the trade.
+    Returns both rosters grouped by position. Each player has points per game,
+    last-3-week production, projections (next 3 weeks and rest of season), injury,
+    bye, and `vs_replacement`: projected points per game above the best free agents
+    at his position in this league. Also returns records, standings, league-wide
+    positional ranks, roster needs, traded draft picks, and the scoring, lineup and
+    playoff rules.
+
+    If players_out/players_in are given, `proposal` simulates both teams' best
+    lineups week by week through the fantasy playoffs, before and after the trade.
+    Empty lineup slots (byes, injuries) are filled with a replacement-level free
+    agent rather than a zero. It reports the per-week change, rest-of-season and
+    playoff-week totals, and the weeks each team would need a waiver starter.
+
+    This is context, not a verdict. Weigh it with things the numbers can't see:
+    record and playoff odds, risk tolerance, injury outlook, and the other manager.
     """
     if my_roster_id == other_roster_id:
         raise SleeperAPIError("my_roster_id and other_roster_id must be different teams.")
     ctx = await api.league_context(league_id)
-    prod, picks = await asyncio.gather(api.production(ctx), api.traded_picks(league_id))
+    prod, picks = await asyncio.gather(api.production(ctx, rest_of_season=True), api.traded_picks(league_id))
     me, them = ctx.team(my_roster_id), ctx.team(other_roster_id)
     out_ids = _resolve_list(players_out, me.players, me.name)
     in_ids = _resolve_list(players_in, them.players, them.name)
 
+    val = Valuation(ctx, prod)
     ranks = position_strength_ranks(ctx, prod)
     standing = {t.roster_id: i for i, t in enumerate(ctx.standings(), 1)}
     s = ctx.settings
-    slots = ctx.starting_slots
 
     def side(t: Team) -> dict[str, Any]:
         d = ctx.team_summary(t)
         d["standing"] = f"{standing[t.roster_id]} of {len(ctx.teams)}"
         d["position_ranks"] = {pos: f"{r}/{len(ctx.teams)}" for pos, r in sorted(ranks[t.roster_id].items())}
         d["needs"] = roster_needs(t, ctx, prod, ranks) or "No thin positions detected."
-        d["roster"] = _team_roster_view(t, prod)
-        acquired = [
-            f"{p['season']} round {p['round']} (originally {ctx.team_label(p['roster_id'])})"
-            for p in picks
-            if p.get("owner_id") == t.roster_id and p.get("roster_id") != t.roster_id
-        ]
-        traded_away = [
-            f"{p['season']} round {p['round']} -> now owned by {ctx.team_label(p['owner_id'])}"
-            for p in picks
-            if p.get("roster_id") == t.roster_id and p.get("owner_id") != t.roster_id
-        ]
-        d["draft_picks"] = {
-            "acquired": acquired or None,
-            "traded_away": traded_away or None,
-            "note": "Any pick not listed as traded away is still owned by its original team.",
-        }
+        d["roster"] = _team_roster_view(t, prod, val)
+        d["draft_picks"] = _pick_summary(ctx, picks, t)
         if s.get("waiver_type") == 2 and s.get("waiver_budget"):
             d["faab_remaining"] = s["waiver_budget"] - (t.waiver_budget_used or 0)
         return d
 
     result: dict[str, Any] = {
-        "league": {
-            "name": ctx.name,
-            "season": ctx.season,
-            "type": _league_type(s),
-            "teams": len(ctx.teams),
-            "current_week": ctx.current_week,
-            "trade_deadline_week": s.get("trade_deadline") or None,
-            "playoff_teams": s.get("playoff_teams"),
-            "playoffs_start_week": s.get("playoff_week_start"),
-            "starting_lineup": slots,
-            "bench_slots": ctx.roster_positions.count("BN"),
-            "scoring": describe_scoring(ctx.scoring),
-        },
+        "league": _league_rules(ctx, val),
         "my_team": side(me),
         "their_team": side(them),
     }
 
     if out_ids or in_ids:
-        value = prod.value
-        me_before, _ = best_lineup(slots, me.players, api.players, value)
-        th_before, _ = best_lineup(slots, them.players, api.players, value)
-        me_after_players = [p for p in me.players if p not in out_ids] + in_ids
-        th_after_players = [p for p in them.players if p not in in_ids] + out_ids
-        me_after, me_lineup_after = best_lineup(slots, me_after_players, api.players, value)
-        th_after, _ = best_lineup(slots, th_after_players, api.players, value)
-        roster_size = len(ctx.roster_positions) - ctx.roster_positions.count("IR")
-
-        def counts(pids: list[str]) -> dict[str, int]:
-            c: dict[str, int] = {}
-            for p in pids:
-                pos = api.players.get(p).get("position") or "?"
-                c[pos] = c.get(pos, 0) + 1
-            return dict(sorted(c.items()))
-
+        my_after = [p for p in me.players if p not in out_ids] + in_ids
+        their_after = [p for p in them.players if p not in in_ids] + out_ids
         proposal: dict[str, Any] = {
-            "i_send": [prod.player_card(p) for p in out_ids],
-            "i_receive": [prod.player_card(p) for p in in_ids],
-            "lineup_value_basis": "Sum of best projected starting lineup per week "
-            "(projected avg over the next few weeks; falls back to recent avg).",
-            "my_lineup_value": {"before": r1(me_before), "after": r1(me_after), "change": r1(me_after - me_before)},
-            "their_lineup_value": {"before": r1(th_before), "after": r1(th_after), "change": r1(th_after - th_before)},
-            "my_position_counts": {"before": counts(me.players), "after": counts(me_after_players)},
-            "their_position_counts": {"before": counts(them.players), "after": counts(th_after_players)},
-            "my_best_lineup_after": _lineup_view(me_lineup_after),
+            "i_send": [_trade_card(prod, val, p) for p in out_ids],
+            "i_receive": [_trade_card(prod, val, p) for p in in_ids],
+            "vs_replacement_sent": r1(sum(val.vor(p) for p in out_ids)),
+            "vs_replacement_received": r1(sum(val.vor(p) for p in in_ids)),
+            "how_lineups_are_measured": LINEUP_METHOD,
+            "my_lineup_change": val.compare(me.players, my_after),
+            "their_lineup_change": val.compare(them.players, their_after),
+            "my_depth": _depth(ctx, prod, me.players, my_after),
+            "their_depth": _depth(ctx, prod, them.players, their_after),
         }
-        net = len(in_ids) - len(out_ids)
-        if net and roster_size:
-            if len(me_after_players) - len(me.reserve) > roster_size:
-                proposal["roster_space"] = f"You'd receive {net} more player(s) than you send and would need to drop someone."
-            if len(th_after_players) - len(them.reserve) > roster_size:
-                proposal["their_roster_space"] = f"They'd receive {-net} more player(s) than they send and would need to drop someone."
+        proposal.update(_roster_space(ctx, me, them, my_after, their_after))
         result["proposal"] = proposal
 
+    result["notes"] = _trade_notes(ctx, prod) or None
+    return result
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def find_trades(
+    league_id: LeagueId,
+    my_roster_id: Annotated[
+        int | None, Field(description="Your roster_id. Or pass username.", ge=1)
+    ] = None,
+    username: Annotated[
+        str | None,
+        Field(description="Your Sleeper username, as an alternative to my_roster_id. Defaults to the SLEEPER_USERNAME env var."),
+    ] = None,
+    target_position: Annotated[
+        str | None,
+        Field(description="Only suggest trades where you receive this position (QB, RB, WR or TE). Omit to consider all."),
+    ] = None,
+    partner_roster_id: Annotated[
+        int | None, Field(description="Only look at trades with this team.", ge=1)
+    ] = None,
+    max_players_per_side: Annotated[
+        int, Field(description="1 for 1-for-1 trades only; 2 also allows 2-for-1 and 1-for-2.", ge=1, le=2)
+    ] = 2,
+    limit: Annotated[int, Field(description="How many trade ideas to return per list (1-15).", ge=1, le=15)] = 8,
+    max_partner_loss: Annotated[
+        float | None,
+        Field(
+            description="Most lineup points per week a one-sided trade may cost the other team. "
+            "Default 2: small asks a sweetener could cover, listed only when win-win trades are scarce "
+            "and ranked closest-to-fair first. Raise it (e.g. 5) or pass null for no limit to always "
+            "list the biggest upgrades for you, ranked purely by your gain.",
+            ge=0,
+        ),
+    ] = DEFAULT_MAX_PARTNER_LOSS,
+) -> dict[str, Any]:
+    """Search every other roster for trades that improve your starting lineup.
+
+    Tries 1-for-1, 2-for-1 and 1-for-2 swaps of players above replacement level
+    (kickers, defenses and IR players are skipped). Each candidate is screened on a
+    typical week, then the best are simulated week by week through the fantasy
+    playoffs, with byes, injuries and waiver streaming accounted for. Only trades
+    where both teams' rest-of-season lineup projection goes up are returned in
+    `win_win`, sorted by how much they help you. `one_sided` lists trades that help
+    you but cost the partner, up to `max_partner_loss` points per week.
+
+    Win-win ideas are realistic offers: the other team gains too. One-sided ideas
+    show what an upgrade would take; their_gain tells you how big a sweetener it
+    needs, and vs_replacement shows whether it looks lopsided on paper. Run
+    trade_context on a promising idea for full rosters and context.
+    """
+    ctx = await api.league_context(league_id)
+    prod = await api.production(ctx, rest_of_season=True)
+    me = await _my_team(ctx, my_roster_id, username)
+    if me is None:
+        raise SleeperAPIError("Tell me which team is yours: pass my_roster_id or username (or set SLEEPER_USERNAME).")
+
+    recv: set[str] | None = None
+    if target_position:
+        pos = target_position.upper().strip()
+        if pos not in {"QB", "RB", "WR", "TE"}:
+            raise SleeperAPIError("target_position must be QB, RB, WR or TE.")
+        recv = {pos}
+    if partner_roster_id is not None:
+        partners = [ctx.team(partner_roster_id)]
+        if partners[0].roster_id == me.roster_id:
+            raise SleeperAPIError("partner_roster_id is your own team.")
+    else:
+        partners = [t for t in ctx.teams.values() if t.roster_id != me.roster_id and t.owner_id]
+
+    val = Valuation(ctx, prod)
+    win_win, one_sided = await asyncio.to_thread(
+        val.search,
+        me,
+        partners,
+        max_per_side=max_players_per_side,
+        receive_positions=recv,
+        max_partner_loss=max_partner_loss,
+    )
+    loose = max_partner_loss is None or max_partner_loss > DEFAULT_MAX_PARTNER_LOSS
+    ranks = position_strength_ranks(ctx, prod)
+    needs = roster_needs(me, ctx, prod, ranks)
+
+    def render(f: dict) -> dict[str, Any]:
+        t: Team = f["partner"]
+        mine, theirs = f["mine"], f["theirs"]
+        idea: dict[str, Any] = {
+            "partner": ctx.team_label(t.roster_id),
+            "partner_roster_id": t.roster_id,
+            "partner_record": t.record,
+            "you_send": [_trade_card(prod, val, p, brief=True) for p in f["give"]],
+            "you_receive": [_trade_card(prod, val, p, brief=True) for p in f["get"]],
+            "your_gain": _gain_summary(mine),
+            "their_gain": _gain_summary(theirs),
+            "vs_replacement_sent": r1(f["vor_sent"]),
+            "vs_replacement_received": r1(f["vor_received"]),
+        }
+        recv_pos = {api.players.get(p).get("position") for p in f["get"]}
+        filled = sorted(recv_pos & set(needs))
+        if filled:
+            idea["addresses_my_needs"] = filled
+        theirs_needs = roster_needs(t, ctx, prod, ranks)
+        sent_pos = {api.players.get(p).get("position") for p in f["give"]}
+        if sorted(sent_pos & set(theirs_needs)):
+            idea["addresses_their_needs"] = sorted(sent_pos & set(theirs_needs))
+        idea.update(_roster_space(ctx, me, t, [p for p in me.players if p not in f["give"]] + f["get"],
+                                  [p for p in t.players if p not in f["get"]] + f["give"]))
+        return idea
+
+    result: dict[str, Any] = {
+        "league": ctx.name,
+        "my_team": me.name,
+        "my_needs": needs or "No thin positions detected.",
+        "weeks_simulated": _weeks_label(val),
+        "how_measured": LINEUP_METHOD,
+        "win_win": [render(f) for f in win_win[:limit]]
+        or "No trade improves both lineups right now. That's common when your bench has few "
+        "players who would start elsewhere.",
+    }
+    limit_text = "no limit" if max_partner_loss is None else f"up to {r1(max_partner_loss)} pts/week"
+    if loose and one_sided:
+        result["one_sided"] = [render(f) for f in one_sided[:limit]]
+        result["one_sided_note"] = (
+            f"These help you and cost the other team ({limit_text}), ranked by your gain. "
+            "Expect pushback unless you add a sweetener or the other manager values players differently."
+        )
+    elif one_sided and len(win_win) < limit:
+        result["one_sided"] = [render(f) for f in one_sided[: max(3, limit - len(win_win))]]
+        result["one_sided_note"] = (
+            f"These help you but cost the other team a little ({limit_text}), closest to fair first. "
+            "They'd likely need a sweetener: a bench player, a draft pick, or FAAB. "
+            "Raise max_partner_loss to see bigger, more lopsided upgrades."
+        )
+    elif loose:
+        result["one_sided"] = f"No trades help you by at least 1 point per week within {limit_text}."
+    notes = _trade_notes(ctx, prod)
+    if notes:
+        result["notes"] = notes
+    return result
+
+
+LINEUP_METHOD = (
+    "Best starting lineup each week from projections under this league's scoring. "
+    "Byes and Out/IR count as zero for that week, and any slot the roster can't fill "
+    "better than the waiver wire is filled with a replacement-level free agent "
+    f"(average of the top {REPLACEMENT_DEPTH} available at that position)."
+)
+
+
+def _weeks_label(val: Valuation) -> str:
+    if val.weeks == [None]:
+        return "one typical week (no weekly projections available)"
+    w = [x for x in val.weeks if x is not None]
+    label = f"weeks {w[0]}-{w[-1]}" if len(w) > 1 else f"week {w[0]}"
+    if val.playoff_weeks:
+        label += f" (playoffs: weeks {val.playoff_weeks[0]}-{val.playoff_weeks[-1]})"
+    return label
+
+
+def _gain_summary(cmp: dict[str, Any]) -> dict[str, Any]:
+    out = {"rest_of_season_total": cmp["rest_of_season_total"], "avg_per_week": cmp["avg_per_week"]}
+    if "playoff_weeks_total" in cmp:
+        out["playoff_weeks_total"] = cmp["playoff_weeks_total"]
+    return out
+
+
+def _trade_card(prod: Production, val: Valuation, pid: str, brief: bool = False) -> dict[str, Any]:
+    extra = {"vs_replacement": r1(val.vor(pid))}
+    if not brief:
+        return prod.player_card(pid, extra=extra)
+    p = api.players.get(pid)
+    n = prod.numbers(pid)
+    card: dict[str, Any] = {"name": p.get("full_name", pid), "pos": p.get("position"), "team": p.get("team") or "FA"}
+    inj = injury_text(p)
+    if inj:
+        card["injury"] = inj
+    for k in ("ppg", "recent_avg", "proj_avg_rest_of_season", "bye_week"):
+        if n.get(k) is not None:
+            card[k] = n[k]
+    card.update(extra)
+    return card
+
+
+def _league_rules(ctx: LeagueContext, val: Valuation) -> dict[str, Any]:
+    s = ctx.settings
+    return {
+        "name": ctx.name,
+        "season": ctx.season,
+        "type": _league_type(s),
+        "teams": len(ctx.teams),
+        "current_week": ctx.current_week,
+        "trade_deadline_week": s.get("trade_deadline") or None,
+        "playoff_teams": s.get("playoff_teams"),
+        "playoff_weeks": ctx.playoff_weeks or None,
+        "starting_lineup": ctx.starting_slots,
+        "bench_slots": ctx.roster_positions.count("BN"),
+        "scoring": describe_scoring(ctx.scoring),
+        "replacement_level_ppg": {
+            pos: r1(v) for pos, v in sorted(val.replacement_ros.items()) if pos in ctx.relevant_positions
+        },
+    }
+
+
+def _pick_summary(ctx: LeagueContext, picks: list[dict], t: Team) -> dict[str, Any]:
+    acquired = [
+        f"{p['season']} round {p['round']} (originally {ctx.team_label(p['roster_id'])})"
+        for p in picks
+        if p.get("owner_id") == t.roster_id and p.get("roster_id") != t.roster_id
+    ]
+    traded_away = [
+        f"{p['season']} round {p['round']} -> now owned by {ctx.team_label(p['owner_id'])}"
+        for p in picks
+        if p.get("roster_id") == t.roster_id and p.get("owner_id") != t.roster_id
+    ]
+    return {
+        "acquired": acquired or None,
+        "traded_away": traded_away or None,
+        "note": "Any pick not listed as traded away is still owned by its original team.",
+    }
+
+
+def _depth(ctx: LeagueContext, prod: Production, before: list[str], after: list[str]) -> dict[str, str]:
+    """Healthy players per starting position vs. what a lineup needs, where it changes."""
+    targets = position_targets(ctx.starting_slots)
+    db = api.players
+
+    def healthy(pids: list[str], pos: str) -> int:
+        return sum(1 for p in pids if pos in db.positions(p) and not is_unavailable(db.get(p)))
+
+    out = {}
+    for pos, want in targets.items():
+        b, a = healthy(before, pos), healthy(after, pos)
+        if a != b:
+            flag = " (below target)" if a < want else ""
+            out[pos] = f"{b} -> {a} healthy (target {want}){flag}"
+    return out or {"unchanged": "No change in healthy players at any starting position."}
+
+
+def _roster_space(ctx: LeagueContext, me: Team, them: Team, my_after: list[str], their_after: list[str]) -> dict[str, str]:
+    size = len(ctx.roster_positions) - ctx.roster_positions.count("IR")
+    out = {}
+    if not size:
+        return out
+    mine_over = len(my_after) - len(me.reserve) - size
+    theirs_over = len(their_after) - len(them.reserve) - size
+    if mine_over > 0:
+        out["my_roster_space"] = f"You'd need to drop {mine_over} player(s) to make room."
+    if theirs_over > 0:
+        out["their_roster_space"] = f"They'd need to drop {theirs_over} player(s) to make room."
+    return out
+
+
+def _trade_notes(ctx: LeagueContext, prod: Production) -> list[str]:
+    s = ctx.settings
     notes = _notes(prod)
     if s.get("trade_deadline") and ctx.current_week and ctx.current_week > s["trade_deadline"]:
         notes.append(f"The trade deadline (week {s['trade_deadline']}) has passed.")
     if s.get("disable_trades"):
         notes.append("Trades are disabled in this league.")
-    if notes:
-        result["notes"] = notes
-    return result
+    if _league_type(s) in ("keeper", "dynasty"):
+        notes.append("This is a keeper/dynasty league: values here cover this season only; age and future value aren't modeled.")
+    return notes
 
 
 # ---- supporting tools ---------------------------------------------------------

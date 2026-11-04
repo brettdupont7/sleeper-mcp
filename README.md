@@ -20,7 +20,8 @@ good for me?" about your real league.
 | Tool | What it does |
 | --- | --- |
 | `waiver_wire` | Ranks unrostered players by projected points, recent production and trending adds, with injury, bye week and opponent. If you pass your team, it flags your thin positions and which players fill them. |
-| `trade_context` | Both rosters by position with production, projections, records, league-wide positional ranks, needs, traded picks and scoring rules. If you list players, it also shows each side's best projected lineup before and after the trade. It gives Claude context and doesn't judge the trade itself. |
+| `trade_context` | Both rosters by position with production, projections, value over replacement, records, league-wide positional ranks, needs, traded picks and scoring rules. If you list players, it simulates both lineups week by week through the fantasy playoffs, before and after the trade. It gives Claude context and doesn't judge the trade itself. |
+| `find_trades` | Searches every other roster for 1-for-1, 2-for-1 and 1-for-2 trades that improve your lineup. Trades that help both sides are listed first. One-sided trades follow, limited by `max_partner_loss` (see below). |
 | `get_user` | Username → `user_id`. |
 | `my_leagues` | A user's leagues for a season, with your `roster_id` and record in each. |
 | `league_overview` | Standings, every team's `roster_id`, lineup, scoring, waiver and playoff rules. |
@@ -46,6 +47,44 @@ A position counts as a **need** when any of these is true:
 - you have fewer healthy players there than your lineup needs, plus one backup at RB/WR
 - your group ranks in the bottom third of the league by projection
 - you can't field it this week because of byes or injuries
+
+### How trades are measured
+
+`trade_context` and `find_trades` measure a trade by what it does to each
+team's **starting lineup**, week by week, from the current week through the
+last week of the fantasy playoffs. Points come from projections scored under
+your league's rules. Two adjustments keep the numbers honest:
+
+- **Replacement level.** Each position's replacement level is the average
+  projection of the top 3 free agents at that position in your league. A
+  player's `vs_replacement` is his projected points per game above that. It's
+  the fairest single number for comparing players across positions.
+- **Streaming.** If a team can't fill a slot one week (bye or injury), the
+  simulation starts a replacement-level free agent there instead of scoring a
+  zero. So a backup QB is worth exactly what he adds over the waiver wire in
+  the weeks he'd actually start.
+
+The output includes the change for each week, rest-of-season and
+playoff-week totals, any weeks a team would have a lineup hole, and whether
+anyone needs to drop a player to make room. The tools don't model things that
+are hard to project: injury risk, a player's role changing, or (in keeper and
+dynasty leagues) value beyond this season. That's left for Claude and you to
+weigh.
+
+`find_trades` returns two lists:
+
+- `win_win`: both teams' lineups improve, so the other manager has a reason to say yes.
+- `one_sided`: trades that help you but cost the other team. `max_partner_loss`
+  sets how much they can lose, in lineup points per week. At the default of 2,
+  these are small asks that a sweetener could cover. They're only listed when
+  win-win trades are scarce, closest to fair first. Raise it (say to 5), or
+  pass null for no limit, to always see the biggest upgrades for you, ranked by
+  your gain. With no limit, expect fantasies like "your backup QB for their two
+  best players". That shows you the ceiling, not a realistic offer.
+
+`find_trades` first screens every combination on a typical week. It then
+simulates the best few dozen candidates week by week and keeps only those
+that help both sides. A whole 10-team league takes well under a second.
 
 ### Undocumented endpoints
 
@@ -154,6 +193,8 @@ publish the URL.
 - "What are my Sleeper leagues?"
 - "Who are the best waiver pickups at RB in my league this week?"
 - "I'm thinking of trading Kirk Cousins to roster 1 for Quinshon Judkins. Give me the context and your take."
+- "Find me a trade that upgrades my TE without hurting my playoff weeks."
+- "Show me the biggest upgrades I could get, even if they're lopsided." (`max_partner_loss` raised)
 - "Show week 8 transactions in my league."
 - "Who owns my 2027 picks?"
 
@@ -168,6 +209,7 @@ Code layout (`src/sleeper_mcp/`):
 
 - `server.py`: tool definitions
 - `sleeper.py`: documented endpoints, league context, lineup and needs logic
+- `trade.py`: replacement level, week-by-week lineup simulation, trade search
 - `undocumented.py`: stats, projections and schedule
 - `scoring.py`: league-specific scoring
 - `players.py`: player DB cache and name resolution
