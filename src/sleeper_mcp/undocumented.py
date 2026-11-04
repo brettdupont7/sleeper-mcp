@@ -81,6 +81,7 @@ class Schedule:
 
     def __init__(self, games: list[dict[str, Any]]):
         self.opp: dict[tuple[str, int], str] = {}
+        self.status: dict[tuple[str, int], str] = {}
         weeks: set[int] = set()
         for g in games:
             wk, home, away = g.get("week"), g.get("home"), g.get("away")
@@ -89,6 +90,7 @@ class Schedule:
             weeks.add(wk)
             self.opp[(home, wk)] = f"vs {away}"
             self.opp[(away, wk)] = f"@ {home}"
+            self.status[(home, wk)] = self.status[(away, wk)] = g.get("status") or ""
         self.weeks = sorted(weeks)
         self.available = bool(self.opp)
 
@@ -96,6 +98,11 @@ class Schedule:
         if not team or not self.available:
             return None
         return self.opp.get((team, week), "BYE" if week in self.weeks else None)
+
+    def game_started(self, team: str | None, week: int) -> bool:
+        """True once a team's game that week has kicked off (players are locked)."""
+        st = self.status.get((team or "", week), "")
+        return bool(st) and st not in ("pre_game", "scheduled", "")
 
     def bye_week(self, team: str | None) -> int | None:
         if not team or not self.available:

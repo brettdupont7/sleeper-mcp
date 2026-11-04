@@ -22,6 +22,8 @@ good for me?" about your real league.
 | `waiver_wire` | Ranks unrostered players by projected points, recent production and trending adds, with injury, bye week and opponent. If you pass your team, it flags your thin positions and which players fill them. |
 | `trade_context` | Both rosters by position with production, projections, value over replacement, records, league-wide positional ranks, needs, traded picks and scoring rules. If you list players, it simulates both lineups week by week through the fantasy playoffs, before and after the trade. It gives Claude context and doesn't judge the trade itself. |
 | `find_trades` | Searches every other roster for 1-for-1, 2-for-1 and 1-for-2 trades that improve your lineup. Trades that help both sides are listed first. One-sided trades follow, limited by `max_partner_loss`. You can rule players out with `exclude_players` or shop one with `must_send` (see below). |
+| `my_lineup` | Weekly start/sit check. It compares your current starters with the best projected lineup and lists swaps, starters on bye or Out, empty slots, free agents worth adding, Questionable starters, and this week's matchup with a win probability. |
+| `playoff_odds` | Simulates the rest of the season thousands of times. Each team gets projected wins plus odds to make the playoffs, earn a bye, take the #1 seed and win the title. With your team, it also shows each remaining matchup's win probability. |
 | `get_user` | Username → `user_id`. |
 | `my_leagues` | A user's leagues for a season, with your `roster_id` and record in each. |
 | `league_overview` | Standings, every team's `roster_id`, lineup, scoring, waiver and playoff rules. |
@@ -96,6 +98,26 @@ don't count toward that cap.
 `find_trades` first screens every combination on a typical week. It then
 simulates the best few dozen candidates week by week and keeps only those
 that help both sides. A whole 10-team league takes well under a second.
+
+### How playoff odds work
+
+`playoff_odds` plays out your league's actual remaining schedule, 5,000 times
+by default. Each team's projected score is its best lineup that week,
+calculated the same way as in the trade tools. This week only counts the
+current roster. Later weeks assume teams pick up free agents for byes and
+injuries. Each score varies randomly around its projection, about ±20 points
+for a typical team. Seeding uses wins, then points for. The fantasy playoffs
+are simulated as a seeded bracket with byes for the top seeds. It handles
+one-week rounds, two-week rounds and a two-week final, plus leagues with an
+extra weekly game against the median score.
+
+`trade_context` uses the same simulation to give both teams a `season_outlook`.
+For a proposed trade, it shows how each side's playoff, bye and title odds
+change. Both runs use the same random results, so the difference comes from
+the trade. Changes of 1–2 points are still noise.
+
+What it doesn't model: points already scored in the current week, future
+waiver pickups and trades, and divisions (seeding ignores them).
 
 ### Undocumented endpoints
 
@@ -207,6 +229,8 @@ publish the URL.
 - "Find me a trade that upgrades my TE without hurting my playoff weeks."
 - "Show me the biggest upgrades I could get, even if they're lopsided." (`max_partner_loss` raised)
 - "What could I get for Bijan? Mahomes and Walker are untouchable." (`must_send` + `exclude_players`)
+- "Is my lineup set for this week?"
+- "What are my playoff odds, and should I be buying or selling?"
 - "Show week 8 transactions in my league."
 - "Who owns my 2027 picks?"
 
@@ -222,6 +246,7 @@ Code layout (`src/sleeper_mcp/`):
 - `server.py`: tool definitions
 - `sleeper.py`: documented endpoints, league context, lineup and needs logic
 - `trade.py`: replacement level, week-by-week lineup simulation, trade search
+- `season.py`: weekly lineup check, season and playoff simulation
 - `undocumented.py`: stats, projections and schedule
 - `scoring.py`: league-specific scoring
 - `players.py`: player DB cache and name resolution

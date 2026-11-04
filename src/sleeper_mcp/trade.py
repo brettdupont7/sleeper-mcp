@@ -157,10 +157,10 @@ class Valuation:
         """Lineup points in an average rest-of-season week (fast; used for screening)."""
         return lineup(self.slots, pids, self.db.positions, self.prod.ros_value, self.replacement_ros).total
 
-    def week(self, pids: Iterable[str], w: int | None) -> LineupResult:
-        return lineup(
-            self.slots, pids, self.db.positions, lambda p: self.prod.week_value(p, w), self.replacement_week[w]
-        )
+    def week(self, pids: Iterable[str], w: int | None, stream: bool = True) -> LineupResult:
+        """Best lineup in week `w`; with `stream`, weak or empty slots use a free agent."""
+        repl = self.replacement_week.get(w, self.replacement_ros) if stream else {}
+        return lineup(self.slots, pids, self.db.positions, lambda p: self.prod.week_value(p, w), repl)
 
     def season(self, pids: list[str]) -> dict[int | None, LineupResult]:
         return {w: self.week(pids, w) for w in self.weeks}

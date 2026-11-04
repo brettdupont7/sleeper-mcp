@@ -26,6 +26,7 @@ from .sleeper import (
     r1,
     roster_needs,
 )
+from .season import DEFAULT_SIMS, SeasonSim, SimResult, lineup_check, pairings, team_projection, win_probability
 from .trade import DEFAULT_MAX_PARTNER_LOSS, REPLACEMENT_DEPTH, Valuation, free_agents
 
 log = logging.getLogger("sleeper_mcp")
@@ -35,7 +36,8 @@ Read-only tools for Sleeper fantasy football (NFL). Nothing here can change a le
 
 Typical flow: get_user or my_leagues (from a Sleeper username) -> league_overview to
 see teams and roster_ids -> waiver_wire for pickups, find_trades to discover trade
-ideas, trade_context to dig into a specific trade.
+ideas, trade_context to dig into a specific trade, my_lineup for weekly start/sit,
+playoff_odds to see who's contending.
 
 All points are computed under the specific league's scoring_settings. Stats and
 projections come from undocumented Sleeper endpoints and can be missing; tools say so
@@ -290,6 +292,9 @@ async def trade_context(
 
     This is context, not a verdict. Weigh it with things the numbers can't see:
     record and playoff odds, risk tolerance, injury outlook, and the other manager.
+
+    Each team also gets a `season_outlook` (playoff and title odds from a season
+    simulation), and a proposal gets `playoff_odds_change` for both sides.
     """
     if my_roster_id == other_roster_id:
         raise SleeperAPIError("my_roster_id and other_roster_id must be different teams.")
@@ -303,6 +308,8 @@ async def trade_context(
     ranks = position_strength_ranks(ctx, prod)
     standing = {t.roster_id: i for i, t in enumerate(ctx.standings(), 1)}
     s = ctx.settings
+    sim = await _season_sim(ctx, val)
+    odds = await asyncio.to_thread(sim.run, TRADE_SIMS) if sim.possible else None
 
     def side(t: Team) -> dict[str, Any]:
         d = ctx.team_summary(t)
@@ -311,6 +318,13 @@ async def trade_context(
         d["needs"] = roster_needs(t, ctx, prod, ranks) or "No thin positions detected."
         d["roster"] = _team_roster_view(t, prod, val)
         d["draft_picks"] = _pick_summary(ctx, picks, t)
+        if odds is not None:
+            rid = t.roster_id
+            d["season_outlook"] = {
+                "playoffs": f"{round(100 * odds.playoffs[rid])}%",
+                "champion": f"{round(100 * odds.champion[rid])}%",
+                "proj_final_wins": r1(odds.wins[rid]),
+            }
         if s.get("waiver_type") == 2 and s.get("waiver_budget"):
             d["faab_remaining"] = s["waiver_budget"] - (t.waiver_budget_used or 0)
         return d
@@ -335,6 +349,16 @@ async def trade_context(
             "my_depth": _depth(ctx, prod, me.players, my_after),
             "their_depth": _depth(ctx, prod, them.players, their_after),
         }
+        if odds is not None:
+            after = await asyncio.to_thread(
+                sim.run, TRADE_SIMS, rosters={me.roster_id: my_after, them.roster_id: their_after}
+            )
+            proposal["playoff_odds_change"] = {
+                "mine": _odds_change(odds, after, me.roster_id),
+                "theirs": _odds_change(odds, after, them.roster_id),
+                "note": f"From {TRADE_SIMS} simulated seasons each, before and after, with the same "
+                "simulated luck, so the difference is the trade. Changes of 1-2 points are noise.",
+            }
         proposal.update(_roster_space(ctx, me, them, my_after, their_after))
         result["proposal"] = proposal
 
@@ -520,6 +544,8 @@ async def find_trades(
     return result
 
 
+TRADE_SIMS = 3000
+
 LINEUP_METHOD = (
     "Best starting lineup each week from projections under this league's scoring. "
     "Byes and Out/IR count as zero for that week, and any slot the roster can't fill "
@@ -641,6 +667,172 @@ def _trade_notes(ctx: LeagueContext, prod: Production) -> list[str]:
     if _league_type(s) in ("keeper", "dynasty"):
         notes.append("This is a keeper/dynasty league: values here cover this season only; age and future value aren't modeled.")
     return notes
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def my_lineup(
+    league_id: LeagueId,
+    my_roster_id: Annotated[int | None, Field(description="Your roster_id. Or pass username.", ge=1)] = None,
+    username: Annotated[
+        str | None,
+        Field(description="Your Sleeper username, as an alternative to my_roster_id. Defaults to the SLEEPER_USERNAME env var."),
+    ] = None,
+    week: Annotated[
+        int | None,
+        Field(description="Week to check. Defaults to the current week. Later weeks use your current lineup and roster.", ge=1, le=18),
+    ] = None,
+) -> dict[str, Any]:
+    """Check your starting lineup for a week (start/sit).
+
+    Shows your current lineup with each starter's projection under this league's
+    scoring, opponent, and problems: byes, Out/IR, empty slots. Compares it with
+    the best projected lineup from your roster and lists the swaps that gain
+    points. Players whose games have kicked off are locked and never moved.
+    Also lists free agents for empty slots, or where one projects 3+ points
+    better, plus Questionable/Doubtful starters to watch, and this week's
+    matchup with both projections and a win probability.
+    """
+    ctx = await api.league_context(league_id)
+    me = await _my_team(ctx, my_roster_id, username)
+    if me is None:
+        raise SleeperAPIError("Tell me which team is yours: pass my_roster_id or username (or set SLEEPER_USERNAME).")
+    week = week or ctx.current_week
+    if not week:
+        raise SleeperAPIError("The NFL regular season isn't in progress, so there's no lineup to check.")
+    if ctx.current_week and week < ctx.current_week:
+        raise SleeperAPIError(f"Week {week} is already over; the current week is {ctx.current_week}.")
+    prod, matchups = await asyncio.gather(api.production(ctx, rest_of_season=True), api.matchups(league_id, week))
+    if week not in prod.week_proj:
+        raise SleeperAPIError(f"No projections available for week {week}.")
+    val = Valuation(ctx, prod)
+    opp_id = next((b if a == me.roster_id else a for a, b in pairings(matchups) if me.roster_id in (a, b)), None)
+    result = lineup_check(ctx, prod, val, me, week, ctx.team(opp_id) if opp_id else None)
+    result = {"league": ctx.name, "team": me.name, **result}
+    notes = _notes(prod)
+    if notes:
+        result["notes"] = notes
+    return result
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def playoff_odds(
+    league_id: LeagueId,
+    my_roster_id: Annotated[
+        int | None, Field(description="Your roster_id, to also get your remaining schedule with win odds.", ge=1)
+    ] = None,
+    username: Annotated[
+        str | None,
+        Field(description="Your Sleeper username, as an alternative to my_roster_id. Defaults to the SLEEPER_USERNAME env var."),
+    ] = None,
+    simulations: Annotated[
+        int, Field(description="Number of simulated seasons (1000-20000). More is steadier but slower.", ge=1000, le=20000)
+    ] = DEFAULT_SIMS,
+) -> dict[str, Any]:
+    """Simulate the rest of the season to estimate each team's playoff and title odds.
+
+    Plays out the league's real remaining schedule thousands of times. Each
+    team's weekly score is random around its best projected lineup under this
+    league's scoring (byes, injuries and waiver streaming included). Seeds use
+    wins, then points for. The fantasy playoffs are played as a seeded bracket
+    with byes for the top seeds. Returns, per team: projected final wins, playoff
+    %, bye %, #1 seed %, title % and average finish. With your team, it also shows
+    each remaining regular-season matchup with your win probability.
+
+    Use it to decide whether to buy (contender) or sell (long shot), and to weigh
+    trades by what they do to playoff weeks.
+    """
+    ctx = await api.league_context(league_id)
+    prod = await api.production(ctx, rest_of_season=True)
+    val = Valuation(ctx, prod)
+    sim = await _season_sim(ctx, val)
+    if not sim.possible:
+        return {
+            "league": ctx.name,
+            "note": "Nothing to simulate: the regular season is over or hasn't started, "
+            "or projections aren't available. See playoff_bracket for the playoffs.",
+        }
+    me = await _my_team(ctx, my_roster_id, username)
+    res = await asyncio.to_thread(sim.run, simulations)
+
+    def pct(x: float) -> str:
+        return "<1%" if 0 < x < 0.005 else ">99%" if 0.995 < x < 1 else f"{round(100 * x)}%"
+
+    rows = []
+    for t in sorted(ctx.teams.values(), key=lambda t: (-res.playoffs[t.roster_id], -res.champion[t.roster_id])):
+        rid = t.roster_id
+        rows.append(
+            {
+                "team": ctx.team_label(rid),
+                "roster_id": rid,
+                "record": t.record,
+                "proj_final_wins": r1(res.wins[rid]),
+                "playoffs": pct(res.playoffs[rid]),
+                "bye": pct(res.bye[rid]),
+                "top_seed": pct(res.top_seed[rid]),
+                "champion": pct(res.champion[rid]),
+                "avg_finish": r1(res.seed[rid]),
+            }
+        )
+    result: dict[str, Any] = {
+        "league": ctx.name,
+        "simulations": simulations,
+        "regular_season_weeks_left": sim.reg_weeks,
+        "playoff_teams": sim.n_playoff,
+        "playoff_weeks": ctx.playoff_weeks,
+        "teams": rows,
+    }
+    if me is not None:
+        sched = []
+        for w in sim.reg_weeks:
+            opp = next((b if a == me.roster_id else a for a, b in sim.schedule[w] if me.roster_id in (a, b)), None)
+            if opp is None:
+                continue
+            m_mean, m_var = team_projection(val, me.players, w)
+            o_mean, o_var = team_projection(val, ctx.team(opp).players, w)
+            sched.append(
+                {
+                    "week": w,
+                    "opponent": ctx.team_label(opp),
+                    "opponent_record": ctx.team(opp).record,
+                    "my_proj": r1(m_mean),
+                    "opp_proj": r1(o_mean),
+                    "win_prob": pct(win_probability(m_mean, m_var, o_mean, o_var)),
+                }
+            )
+        result["my_team"] = me.name
+        result["my_remaining_schedule"] = sched
+    notes = [
+        "Each team is assumed to start its best projected lineup every week.",
+        f"This week's games are simulated from projections; points already scored in week {ctx.current_week} aren't counted."
+        if ctx.current_week
+        else None,
+        "Rosters are frozen at today's; future pickups and trades aren't modeled.",
+    ]
+    if ctx.settings.get("divisions"):
+        notes.append("Divisions aren't modeled: seeding uses overall wins, then points for.")
+    if sim.median_game:
+        notes.append("Includes the league's extra weekly game against the median score.")
+    result["notes"] = [n for n in notes if n] + _notes(prod)
+    return result
+
+
+async def _season_sim(ctx: LeagueContext, val: Valuation) -> SeasonSim:
+    start = int(ctx.settings.get("playoff_week_start") or 0)
+    weeks = [w for w in val.weeks if w is not None and (not start or w < start)]
+    responses = await asyncio.gather(*(api.matchups(ctx.league_id, w) for w in weeks))
+    return SeasonSim(ctx, val, {w: pairings(r) for w, r in zip(weeks, responses)})
+
+
+def _odds_change(before: SimResult, after: SimResult, rid: int) -> dict[str, str]:
+    def fmt(b: float, a: float) -> str:
+        d = round(100 * (a - b))
+        return f"{round(100 * b)}% -> {round(100 * a)}% ({'+' if d >= 0 else ''}{d})"
+
+    return {
+        "playoffs": fmt(before.playoffs[rid], after.playoffs[rid]),
+        "bye": fmt(before.bye[rid], after.bye[rid]),
+        "champion": fmt(before.champion[rid], after.champion[rid]),
+    }
 
 
 # ---- supporting tools ---------------------------------------------------------

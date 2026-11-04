@@ -197,6 +197,8 @@ class Team:
     waiver_budget_used: int | None
     waiver_position: int | None
     co_owner_ids: list[str] = field(default_factory=list)
+    # Current lineup as Sleeper stores it: one entry per starting slot, None if empty.
+    lineup_slots: list[tuple[str, str | None]] = field(default_factory=list)
 
     @property
     def record(self) -> str:
@@ -243,6 +245,10 @@ class LeagueContext:
                 waiver_budget_used=s.get("waiver_budget_used"),
                 waiver_position=s.get("waiver_position"),
                 co_owner_ids=list(r.get("co_owners") or []),
+                lineup_slots=[
+                    (slot, str(pid) if pid and str(pid) != "0" else None)
+                    for slot, pid in zip(self.starting_slots, r.get("starters") or [])
+                ],
             )
 
     # ---- lookups ------------------------------------------------------------
